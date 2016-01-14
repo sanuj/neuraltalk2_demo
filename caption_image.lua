@@ -1,4 +1,5 @@
 require 'torch'
+require 'redis'
 require 'nn'
 require 'nngraph'
 require 'io'
@@ -48,7 +49,6 @@ cmd:option('-backend', 'cudnn', 'nn|cudnn')
 cmd:option('-id', 'evalscript', 'an id identifying this run/job. used only if language_eval = 1 for appending to intermediate files')
 cmd:option('-seed', 123, 'random number generator seed to use')
 cmd:option('-gpuid', 0, 'which gpu to use. -1 = use CPU')
-cmd:option('-caption_file_name', 'image', 'name for the caption file')
 cmd:text()
 
 -------------------------------------------------------------------------------
@@ -80,13 +80,6 @@ for k,v in pairs(fetch) do
   opt[v] = checkpoint.opt[v] -- copy over options from model
 end
 local vocab = checkpoint.vocab -- ix -> word mapping
-print('DATA LOADED!!')
-
--------------------------------------------------------------------------------
--- Create the Data Loader instance
--------------------------------------------------------------------------------
-local loader
-loader = DataLoaderRaw{folder_path = opt.image_folder, coco_json = opt.coco_json}
 
 -------------------------------------------------------------------------------
 -- Load the networks from model checkpoint
@@ -96,20 +89,17 @@ protos.expander = nn.FeatExpander(opt.seq_per_img)
 protos.crit = nn.LanguageModelCriterion()
 protos.lm:createClones() -- reconstruct clones inside the language model
 if opt.gpuid >= 0 then for k,v in pairs(protos) do v:cuda() end end
-print('DATA LOADED 1 !!')
 
-local function sleep(n)
-  os.execute("sleep " .. tonumber(n))
-end
--------------------------------------------------------------------------------
--- Evaluation fun(ction)
--------------------------------------------------------------------------------
-local function eval_split(split, evalopt)
-  local verbose = utils.getopt(evalopt, 'verbose', true)
-  local num_images = utils.getopt(evalopt, 'num_images', true)
+protos.cnn:evaluate()
+protos.lm:evaluate()
+client = Redis.connect('127.0.0.1', 6379)
 
-  protos.cnn:evaluate()
-  protos.lm:evaluate()
+while true do
+  image_folder = client:brpop('imagequeue', 0)[2]
+  garbage, caption_file_name = string.match(image_folder, "(.-)([^\\/]-%.?([^%.\\/]*))$")
+
+  local loader
+  loader = DataLoaderRaw{folder_path = image_folder, coco_json = opt.coco_json}
   loader:resetIterator(split) -- rewind iteator back to first datapoint in the split
   local n = 0
   local predictions = {}
@@ -136,17 +126,12 @@ local function eval_split(split, evalopt)
 
     -- if we wrapped around the split or used up val imgs budget then bail
     local ix0 = data.bounds.it_pos_now
-    local ix1 = math.min(data.bounds.it_max, num_images)
+    local ix1 = math.min(data.bounds.it_max, opt.num_images)
 
     if data.bounds.wrapped then break end -- the split ran out of data, lets break out
-    if num_images >= 0 and n >= num_images then break end -- we've used enough images
+    if opt.num_images >= 0 and n >= opt.num_images then break end -- we've used enough images
   end
-
-  return predictions
+  -- print(caption_file_name)
+  -- print(predictions[1]['caption'])
+  client:set(caption_file_name, predictions[1]['caption'])
 end
-
-local split_predictions = eval_split(opt.split, {num_images = opt.num_images})
-
-caption_file = io.open("../captions/" .. opt.caption_file_name .. ".txt", 'w')
-caption_file:write(split_predictions[1]['caption'])
-caption_file:close()
